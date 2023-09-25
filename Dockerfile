@@ -4,9 +4,12 @@ RUN apk add --update ca-certificates
 
 WORKDIR /workspace
 
-COPY . .
+COPY go.mod ./
+COPY go.sum ./
 
 RUN go mod download
+
+COPY . .
 
 RUN mkdir dist &&\
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/prometheus-mongodb-adapter main.go

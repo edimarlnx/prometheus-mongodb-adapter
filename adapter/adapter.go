@@ -14,7 +14,6 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -43,13 +42,13 @@ func createIndex(coll *mongo.Collection) {
 	collIdx := mongo.IndexModel{Keys: bson.D{{"labels.__name__", 1}}, Options: &options.IndexOptions{Name: &indexName}}
 	_, err := coll.Indexes().CreateOne(context.TODO(), collIdx)
 	if err != nil {
-		panic(err)
+		logrus.Fatal(err)
 	}
 	indexName = "samplesMinDateTime"
 	collIdx = mongo.IndexModel{Keys: bson.D{{"samplesMinDateTime", 1}}, Options: &options.IndexOptions{Name: &indexName}}
 	_, err = coll.Indexes().CreateOne(context.TODO(), collIdx)
 	if err != nil {
-		panic(err)
+		logrus.Fatal(err)
 	}
 }
 
@@ -60,14 +59,14 @@ func New(urlString, database, collection string) (*MongoDBAdapter, error) {
 	}
 	cs, err := connstring.Parse(urlString)
 	if err != nil {
-		panic(err)
+		logrus.Fatal(err)
 	}
 	if cs.Database == "" {
 		cs.Database = database
 	}
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(cs.String()))
 	if err != nil {
-		panic(err)
+		logrus.Fatal(err)
 	}
 	coll := client.Database(cs.Database).Collection(collection)
 
@@ -82,7 +81,7 @@ func New(urlString, database, collection string) (*MongoDBAdapter, error) {
 // Close closes the connection with MongoDB
 func (p *MongoDBAdapter) Close() {
 	if err := p.client.Disconnect(context.TODO()); err != nil {
-		panic(err)
+		logrus.Fatal(err)
 	}
 }
 
@@ -151,28 +150,49 @@ func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Reques
 	if !p.handleAuthRequest(w, r, params) {
 		return
 	}
-	compressed, err := ioutil.ReadAll(r.Body)
+	data, err := p.loadData(w, r)
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	w.Header().Set("Content-Encoding", "snappy")
+	if _, err := w.Write(snappy.Encode(nil, data)); err != nil {
 		logrus.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+}
+
+func readRequestFromBody(w http.ResponseWriter, r *http.Request) (*prompb.ReadRequest, error) {
+	compressed, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return nil, err
 	}
 
 	reqBuf, err := snappy.Decode(nil, compressed)
 	if err != nil {
 		logrus.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, err
 	}
 
 	var req prompb.ReadRequest
 	if err := proto.Unmarshal(reqBuf, &req); err != nil {
 		logrus.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, err
 	}
+	return &req, nil
+}
 
-	results := []*prompb.QueryResult{}
+func (p *MongoDBAdapter) loadData(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	req, err := readRequestFromBody(w, r)
+	if err != nil {
+		return nil, err
+	}
+	var results []*prompb.QueryResult
 	for _, q := range req.Queries {
 		query := map[string]interface{}{
 			"samplesMinDateTime": map[string]interface{}{
@@ -214,19 +234,16 @@ func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Reques
 			},
 		})
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 		defer cursor.Close(context.TODO())
 
 		var timeSeriesResult []*prompb.TimeSeries
 
-		var ts timeSeries
-		for cursor.Next(context.TODO()) {
-			if err = cursor.Decode(&ts); err != nil {
-				panic(err)
-			}
+		var tsDB []timeSeries
+		cursor.All(context.TODO(), &tsDB)
+		for _, ts := range tsDB {
 			var labels []prompb.Label
-
 			for key, value := range ts.Labels {
 				labels = append(labels, prompb.Label{Name: key, Value: value})
 			}
@@ -240,25 +257,14 @@ func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Reques
 			})
 		}
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 
 		results = append(results, &prompb.QueryResult{
 			Timeseries: timeSeriesResult,
 		})
 	}
-	data, err := proto.Marshal(&prompb.ReadResponse{
+	return proto.Marshal(&prompb.ReadResponse{
 		Results: results,
 	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Header().Set("Content-Encoding", "snappy")
-	if _, err := w.Write(snappy.Encode(nil, data)); err != nil {
-		logrus.Error(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 }

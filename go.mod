@@ -3,7 +3,6 @@ module github.com/edimarlnx/prometheus-mongodb-adapter
 go 1.21.0
 
 require (
-	github.com/globalsign/mgo v0.0.0-20180220100256-baa28fcb8e7d
 	github.com/gogo/protobuf v1.3.2
 	github.com/golang/snappy v0.0.4
 	github.com/gorilla/handlers v1.3.0
