@@ -6,7 +6,7 @@ import (
 	"github.com/sirupsen/logrus"
 	cli "gopkg.in/urfave/cli.v1"
 
-	"github.com/sasurai-ossan/prometheus-mongodb-adapter/adapter"
+	"github.com/edimarlnx/prometheus-mongodb-adapter/adapter"
 )
 
 var (
@@ -39,7 +39,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "mongo-url,m",
-			EnvVar:      "MONGO_URL",
+			EnvVar:      "MONGO_URI",
 			Value:       "mongodb://localhost:27017/prometheus",
 			Destination: &urlString,
 		},

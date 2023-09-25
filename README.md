@@ -2,38 +2,8 @@
 
 Now under development
 
-## Features & TODO
-
-- [x] Prometheus remote storage adapter implementation for MongoDB
-- [x] Long-Term Storage
-- [ ] Prometheus 1.8 support
-- [x] Prometheus 2.1 support
-- [ ] MongoDB 3.0 support
-- [ ] MongoDB 3.2 support
-- [ ] MongoDB 3.4 support
-- [x] MongoDB 3.6 support
-- [ ] MongoDB 3.7 support
-- [x] Secure MongoDB support (tls connection)
-- [x] Azure CosmosDB MongoDB API support
-- [ ] Unit test
-- [ ] Add Index
-
 ## Getting Started
 
-### Docker
-
-```bash
-docker run -it \
-    --name prometheus-mongodb-adapter \
-    -p 8080:8080 \
-    sasuraiossan/prometheus-mongodb-adapter
-```
-
-### go get
-
-```bash
-# TODO
-```
 
 ## Configuration
 
@@ -43,7 +13,7 @@ NAME:
    prometheus-mongodb-adapter
 
 OPTIONS:
-   --mongo-url value, -m value   (default: "mongodb://localhost:27017/prometheus") [$MONGO_URL]
+   --mongo-url value, -m value   (default: "mongodb://localhost:27017/prometheus") [$MONGO_URI]
    --database value, -d value    (default: "prometheus") [$DATABASE_NAME]
    --collection value, -c value  (default: "prometheus") [$COLLECTION_NAME]
    --address value, -a value     (default: "0.0.0.0:8080") [$LISTEN_ADDRESS]
@@ -53,6 +23,11 @@ OPTIONS:
 
 If database name is included in `mongo-url`, `databse` argument is ignored.
 
+
 ## License
 
 MIT License
+
+### Original author
+
+Forked from [kiragoo/prometheus-mongodb-adapter](https://github.com/kiragoo/prometheus-mongodb-adapter)

@@ -1,0 +1,26 @@
+name: Meteor images
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'revision'
+        required: true
+        default: 'main'
+        type: string
+jobs:
+  BuildMeteorImages:
+    env:
+      IMAGE_NAME: edimarlnx/prometheus-mongodb-adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: docker build -t ${IMAGE_NAME} .
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push image
+        run: docker push ${IMAGE_NAME}

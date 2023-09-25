@@ -1,33 +1,30 @@
 package adapter
 
 import (
-	"crypto/tls"
+	"context"
 	"fmt"
-	"io/ioutil"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"strings"
-
-	"github.com/globalsign/mgo"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
-	"github.com/prometheus/prometheus/prompb"
-	"github.com/sirupsen/logrus"
-
 	"github.com/gorilla/handlers"
 	"github.com/julienschmidt/httprouter"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/sirupsen/logrus"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
 )
 
 type timeSeries struct {
-	Labels  []*label  `bson:"labels,omitempty"`
-	Samples []*sample `bson:"samples,omitempty"`
-}
-
-type label struct {
-	Name  string `bson:"name,omitempty"`
-	Value string `bson:"value,omitempty"`
+	Labels             map[string]string `bson:"labels,omitempty"`
+	Samples            []*sample         `bson:"samples,omitempty"`
+	SamplesMinDateTime int64             `bson:"samplesMinDateTime,omitempty"`
+	SamplesMaxDateTime int64             `bson:"samplesMaxDateTime,omitempty"`
 }
 
 type sample struct {
@@ -37,69 +34,71 @@ type sample struct {
 
 // MongoDBAdapter is an implemantation of prometheus remote stprage adapter for MongoDB
 type MongoDBAdapter struct {
-	session *mgo.Session
-	c       *mgo.Collection
+	client *mongo.Client
+	c      *mongo.Collection
+}
+
+func createIndex(coll *mongo.Collection) {
+	indexName := "name"
+	collIdx := mongo.IndexModel{Keys: bson.D{{"labels.__name__", 1}}, Options: &options.IndexOptions{Name: &indexName}}
+	_, err := coll.Indexes().CreateOne(context.TODO(), collIdx)
+	if err != nil {
+		panic(err)
+	}
+	indexName = "samplesMinDateTime"
+	collIdx = mongo.IndexModel{Keys: bson.D{{"samplesMinDateTime", 1}}, Options: &options.IndexOptions{Name: &indexName}}
+	_, err = coll.Indexes().CreateOne(context.TODO(), collIdx)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // New provides a MongoDBAdapter after initialization
 func New(urlString, database, collection string) (*MongoDBAdapter, error) {
-
-	u, err := url.Parse(urlString)
+	if urlString == "" {
+		log.Fatal("You must set your 'MONGO_URI' environment variable. See\n\t https://www.mongodb.com/docs/drivers/go/current/usage-examples/#environment-variable")
+	}
+	cs, err := connstring.Parse(urlString)
 	if err != nil {
-		return nil, fmt.Errorf("url parse error: %s", err.Error())
+		panic(err)
 	}
-	query := u.Query()
-	u.RawQuery = ""
-
-	// DialInfo
-	dialInfo, err := mgo.ParseURL(u.String())
+	if cs.Database == "" {
+		cs.Database = database
+	}
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(cs.String()))
 	if err != nil {
-		return nil, fmt.Errorf("mongo url parse error: %s", err.Error())
+		panic(err)
 	}
+	coll := client.Database(cs.Database).Collection(collection)
 
-	// SSL
-	if strings.ToLower(query.Get("ssl")) == "true" {
-		dialInfo.DialServer = func(addr *mgo.ServerAddr) (net.Conn, error) {
-			return tls.Dial("tcp", addr.String(), &tls.Config{})
-		}
-	}
-
-	// Dial
-	session, err := mgo.DialWithInfo(dialInfo)
-	if err != nil {
-		return nil, fmt.Errorf("dial error: %s", err.Error())
-	}
-
-	// Database
-	if dialInfo.Database == "" {
-		dialInfo.Database = database
-	}
-	c := session.DB(dialInfo.Database).C(collection)
+	createIndex(coll)
 
 	return &MongoDBAdapter{
-		session: session,
-		c:       c,
+		client: client,
+		c:      coll,
 	}, nil
 }
 
 // Close closes the connection with MongoDB
 func (p *MongoDBAdapter) Close() {
-
-	p.session.Close()
+	if err := p.client.Disconnect(context.TODO()); err != nil {
+		panic(err)
+	}
 }
 
 // Run serves with http listener
 func (p *MongoDBAdapter) Run(address string) error {
-
 	router := httprouter.New()
-	router.POST("/write", p.handleWriteRequest)
-	router.POST("/read", p.handleReadRequest)
+	router.POST("/api/v1/write", p.handleWriteRequest)
+	router.POST("/api/v1/read", p.handleReadRequest)
 	return http.ListenAndServe(address, handlers.RecoveryHandler()(handlers.LoggingHandler(os.Stdout, router)))
 }
 
-func (p *MongoDBAdapter) handleWriteRequest(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-
-	compressed, err := ioutil.ReadAll(r.Body)
+func (p *MongoDBAdapter) handleWriteRequest(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	if !p.handleAuthRequest(w, r, params) {
+		return
+	}
+	compressed, err := io.ReadAll(r.Body)
 	if err != nil {
 		logrus.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -122,22 +121,25 @@ func (p *MongoDBAdapter) handleWriteRequest(w http.ResponseWriter, r *http.Reque
 
 	for _, ts := range req.Timeseries {
 		mongoTS := &timeSeries{
-			Labels:  []*label{},
+			Labels:  map[string]string{},
 			Samples: []*sample{},
 		}
 		for _, l := range ts.Labels {
-			mongoTS.Labels = append(mongoTS.Labels, &label{
-				Name:  l.Name,
-				Value: l.Value,
-			})
+			mongoTS.Labels[l.Name] = l.Value
 		}
 		for _, s := range ts.Samples {
+			if mongoTS.SamplesMinDateTime == 0 || s.Timestamp < mongoTS.SamplesMinDateTime {
+				mongoTS.SamplesMinDateTime = s.Timestamp
+			}
+			if mongoTS.SamplesMaxDateTime == 0 || s.Timestamp > mongoTS.SamplesMaxDateTime {
+				mongoTS.SamplesMaxDateTime = s.Timestamp
+			}
 			mongoTS.Samples = append(mongoTS.Samples, &sample{
 				Timestamp: s.Timestamp,
 				Value:     s.Value,
 			})
 		}
-		if err := p.c.Insert(mongoTS); err != nil {
+		if _, err := p.c.InsertOne(context.TODO(), mongoTS); err != nil {
 			logrus.Error(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -145,8 +147,10 @@ func (p *MongoDBAdapter) handleWriteRequest(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-
+func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	if !p.handleAuthRequest(w, r, params) {
+		return
+	}
 	compressed, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		logrus.Error(err)
@@ -170,86 +174,89 @@ func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Reques
 
 	results := []*prompb.QueryResult{}
 	for _, q := range req.Queries {
-
 		query := map[string]interface{}{
-			"samples": map[string]interface{}{
-				"$elemMatch": map[string]interface{}{
-					"timestamp": map[string]interface{}{
-						"$gte": q.StartTimestampMs,
-						"$lte": q.EndTimestampMs,
-					},
-				},
+			"samplesMinDateTime": map[string]interface{}{
+				"$gte": q.StartTimestampMs,
+			},
+			"samplesMaxDateTime": map[string]interface{}{
+				"$lte": q.EndTimestampMs,
 			},
 		}
 		if q.Matchers != nil && len(q.Matchers) > 0 {
-			matcher := []map[string]interface{}{}
 			for _, m := range q.Matchers {
 				switch m.Type {
 				case prompb.LabelMatcher_EQ:
-					matcher = append(matcher, map[string]interface{}{
-						"$elemMatch": map[string]interface{}{
-							m.Name: m.Value,
-						},
-					})
+					query[fmt.Sprintf("labels.%s", m.Name)] = m.Value
 				case prompb.LabelMatcher_NEQ:
-					matcher = append(matcher, map[string]interface{}{
-						"$elemMatch": map[string]interface{}{
-							m.Name: map[string]interface{}{
-								"$ne": m.Value,
-							},
-						},
-					})
+					query[fmt.Sprintf("labels.%s", m.Name)] = map[string]interface{}{
+						"$ne": m.Value,
+					}
 				case prompb.LabelMatcher_RE:
-					matcher = append(matcher, map[string]interface{}{
-						"$elemMatch": map[string]interface{}{
-							m.Name: map[string]interface{}{
-								"$regex": m.Value,
-							},
-						},
-					})
+					query[fmt.Sprintf("labels.%s", m.Name)] = map[string]interface{}{
+						"$regex": m.Value,
+					}
 				case prompb.LabelMatcher_NRE:
-					matcher = append(matcher, map[string]interface{}{
-						"$elemMatch": map[string]interface{}{
-							m.Name: map[string]interface{}{
-								"$not": map[string]interface{}{
-									"$regex": m.Value,
-								},
-							},
+					query[fmt.Sprintf("labels.%s", m.Name)] = map[string]interface{}{
+						"$not": map[string]interface{}{
+							"$regex": m.Value,
 						},
-					})
+					}
 				}
 			}
-			query["labels"] = map[string]interface{}{
-				"$all": matcher,
-			}
 		}
+		cursor, err := p.c.Find(context.TODO(), query, &options.FindOptions{
+			Sort: map[string]int32{
+				"samplesMinDateTime": 1,
+			},
+			Projection: map[string]int32{
+				"samples": 1,
+				"labels":  1,
+			},
+		})
+		if err != nil {
+			panic(err)
+		}
+		defer cursor.Close(context.TODO())
 
-		iter := p.c.Find(query).Sort("samples.timestamp").Iter()
-		defer iter.Close()
+		var timeSeriesResult []*prompb.TimeSeries
 
-		timeseries := []*prompb.TimeSeries{}
 		var ts timeSeries
-		for iter.Next(&ts) {
-			timeseries = append(timeseries, &prompb.TimeSeries{})
+		for cursor.Next(context.TODO()) {
+			if err = cursor.Decode(&ts); err != nil {
+				panic(err)
+			}
+			var labels []prompb.Label
+
+			for key, value := range ts.Labels {
+				labels = append(labels, prompb.Label{Name: key, Value: value})
+			}
+			var samples []prompb.Sample
+			for _, sample := range ts.Samples {
+				samples = append(samples, prompb.Sample{Timestamp: sample.Timestamp, Value: sample.Value})
+			}
+			timeSeriesResult = append(timeSeriesResult, &prompb.TimeSeries{
+				Labels:  labels,
+				Samples: samples,
+			})
+		}
+		if err != nil {
+			log.Fatal(err)
 		}
 
 		results = append(results, &prompb.QueryResult{
-			Timeseries: timeseries,
+			Timeseries: timeSeriesResult,
 		})
 	}
-	resp := &prompb.ReadResponse{
+	data, err := proto.Marshal(&prompb.ReadResponse{
 		Results: results,
-	}
-	data, err := proto.Marshal(resp)
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Encoding", "snappy")
-	compressed = snappy.Encode(nil, data)
-	if _, err := w.Write(compressed); err != nil {
+	if _, err := w.Write(snappy.Encode(nil, data)); err != nil {
 		logrus.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
