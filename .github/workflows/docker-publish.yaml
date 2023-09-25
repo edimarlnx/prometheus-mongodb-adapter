@@ -31,7 +31,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Push image
         run: docker push ${IMAGE_NAME}:${{ inputs.revision }}
-      - name: Push image
+      - name: Push image as latest
         if: ${{ inputs.useLatestVersion }}
         run: |
           docker tag ${IMAGE_NAME}:${{ inputs.revision }} ${IMAGE_NAME}:latest
