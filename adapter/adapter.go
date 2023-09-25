@@ -1,22 +1,28 @@
 package adapter
 
 import (
-	"crypto/tls"
-	"fmt"
-	"github.com/globalsign/mgo"
+	"context"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/gorilla/handlers"
 	"github.com/julienschmidt/httprouter"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/sirupsen/logrus"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 	"io/ioutil"
-	"net"
+	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"strings"
 )
+
+type timeSerieDB struct {
+	Name    string    `bson:"name,omitempty"`
+	Labels  []*label  `bson:"labels,omitempty"`
+	Samples []*sample `bson:"samples,omitempty"`
+}
 
 type timeSeries struct {
 	Labels  []*label  `bson:"labels,omitempty"`
@@ -35,60 +41,62 @@ type sample struct {
 
 // MongoDBAdapter is an implemantation of prometheus remote stprage adapter for MongoDB
 type MongoDBAdapter struct {
-	session *mgo.Session
-	c       *mgo.Collection
+	cs     *connstring.ConnString
+	client *mongo.Client
+	c      *mongo.Collection
+}
+
+func createIndex(coll *mongo.Collection) {
+	indexName := "name"
+	collIdx := mongo.IndexModel{Keys: bson.D{{"name", 1}}, Options: &options.IndexOptions{Name: &indexName}}
+	_, err := coll.Indexes().CreateOne(context.TODO(), collIdx)
+	if err != nil {
+		panic(err)
+	}
+	indexName = "timestamp"
+	collIdx = mongo.IndexModel{Keys: bson.D{{"samples.timestamp", 1}}, Options: &options.IndexOptions{Name: &indexName}}
+	_, err = coll.Indexes().CreateOne(context.TODO(), collIdx)
+	if err != nil {
+		panic(err)
+	}
 }
 
 // New provides a MongoDBAdapter after initialization
 func New(urlString, database, collection string) (*MongoDBAdapter, error) {
-
-	u, err := url.Parse(urlString)
+	if urlString == "" {
+		log.Fatal("You must set your 'MONGODB_URI' environment variable. See\n\t https://www.mongodb.com/docs/drivers/go/current/usage-examples/#environment-variable")
+	}
+	cs, err := connstring.Parse(urlString)
 	if err != nil {
-		return nil, fmt.Errorf("url parse error: %s", err.Error())
+		panic(err)
 	}
-	query := u.Query()
-	u.RawQuery = ""
-
-	// DialInfo
-	dialInfo, err := mgo.ParseURL(u.String())
+	if cs.Database == "" {
+		cs.Database = database
+	}
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(cs.String()))
 	if err != nil {
-		return nil, fmt.Errorf("mongo url parse error: %s", err.Error())
+		panic(err)
 	}
+	coll := client.Database(cs.Database).Collection(collection)
 
-	// SSL
-	if strings.ToLower(query.Get("ssl")) == "true" {
-		dialInfo.DialServer = func(addr *mgo.ServerAddr) (net.Conn, error) {
-			return tls.Dial("tcp", addr.String(), &tls.Config{})
-		}
-	}
-	//dialInfo.Timeout, _ = time.ParseDuration("10s")
-	// Dial
-	session, err := mgo.DialWithInfo(dialInfo)
-	if err != nil {
-		return nil, fmt.Errorf("dial error: %s", err.Error())
-	}
-
-	// Database
-	if dialInfo.Database == "" {
-		dialInfo.Database = database
-	}
-	c := session.DB(dialInfo.Database).C(collection)
+	createIndex(coll)
 
 	return &MongoDBAdapter{
-		session: session,
-		c:       c,
+		cs:     &cs,
+		client: client,
+		c:      coll,
 	}, nil
 }
 
 // Close closes the connection with MongoDB
 func (p *MongoDBAdapter) Close() {
-
-	p.session.Close()
+	if err := p.client.Disconnect(context.TODO()); err != nil {
+		panic(err)
+	}
 }
 
 // Run serves with http listener
 func (p *MongoDBAdapter) Run(address string) error {
-
 	router := httprouter.New()
 	router.POST("/write", p.handleWriteRequest)
 	router.POST("/read", p.handleReadRequest)
@@ -121,11 +129,14 @@ func (p *MongoDBAdapter) handleWriteRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	for _, ts := range req.Timeseries {
-		mongoTS := &timeSeries{
+		mongoTS := &timeSerieDB{
 			Labels:  []*label{},
 			Samples: []*sample{},
 		}
 		for _, l := range ts.Labels {
+			if l.Name == "__name__" {
+				mongoTS.Name = l.Value
+			}
 			mongoTS.Labels = append(mongoTS.Labels, &label{
 				Name:  l.Name,
 				Value: l.Value,
@@ -137,7 +148,7 @@ func (p *MongoDBAdapter) handleWriteRequest(w http.ResponseWriter, r *http.Reque
 				Value:     s.Value,
 			})
 		}
-		if err := p.c.Insert(mongoTS); err != nil {
+		if _, err := p.c.InsertOne(context.TODO(), mongoTS); err != nil {
 			logrus.Error(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -183,9 +194,14 @@ func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Reques
 				},
 			},
 		}
+		var metricName string
 		if q.Matchers != nil && len(q.Matchers) > 0 {
 			matcher := []map[string]interface{}{}
 			for _, m := range q.Matchers {
+				if m.Name == "__name__" {
+					metricName = m.Value
+					continue
+				}
 				switch m.Type {
 				case prompb.LabelMatcher_EQ:
 					matcher = append(matcher, map[string]interface{}{
@@ -221,22 +237,33 @@ func (p *MongoDBAdapter) handleReadRequest(w http.ResponseWriter, r *http.Reques
 					})
 				}
 			}
-			query["labels"] = map[string]interface{}{
-				"$all": matcher,
+			if len(matcher) > 0 {
+				query["labels"] = map[string]interface{}{
+					"$all": matcher,
+				}
 			}
+			query["name"] = metricName
 		}
 
-		iter := p.c.Find(query).Sort("samples.timestamp").Iter()
-		defer iter.Close()
+		cursor, err := p.c.Find(context.TODO(), query, &options.FindOptions{
+			Projection: map[string]int32{
+				"samples": 1,
+				"labels":  1,
+			},
+		})
+		if err != nil {
+			panic(err)
+		}
+		defer cursor.Close(context.TODO())
 
-		timeseries := []*prompb.TimeSeries{}
-		var ts timeSeries
-		for iter.Next(&ts) {
-			timeseries = append(timeseries, &prompb.TimeSeries{})
+		var timeSeries []*prompb.TimeSeries
+		cursor.All(context.TODO(), &timeSeries)
+		if err != nil {
+			log.Fatal(err)
 		}
 
 		results = append(results, &prompb.QueryResult{
-			Timeseries: timeseries,
+			Timeseries: timeSeries,
 		})
 	}
 	resp := &prompb.ReadResponse{
