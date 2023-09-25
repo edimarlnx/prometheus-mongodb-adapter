@@ -9,7 +9,7 @@ on:
         default: 'main'
         type: string
 jobs:
-  BuildMeteorImages:
+  BuildImages:
     env:
       IMAGE_NAME: edimarlnx/prometheus-mongodb-adapter
     runs-on: ubuntu-latest
