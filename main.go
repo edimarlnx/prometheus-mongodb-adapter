@@ -39,7 +39,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "mongo-url,m",
-			EnvVar:      "MONGO_URL",
+			EnvVar:      "MONGO_URI",
 			Value:       "mongodb://localhost:27017/prometheus",
 			Destination: &urlString,
 		},
