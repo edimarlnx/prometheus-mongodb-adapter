@@ -88,6 +88,7 @@ func (p *MongoDBAdapter) Close() {
 // Run serves with http listener
 func (p *MongoDBAdapter) Run(address string) error {
 	router := httprouter.New()
+	router.GET("/_health", p.handleHealthRequest)
 	router.POST("/api/v1/write", p.handleWriteRequest)
 	router.POST("/api/v1/read", p.handleReadRequest)
 	return http.ListenAndServe(address, handlers.RecoveryHandler()(handlers.LoggingHandler(os.Stdout, router)))

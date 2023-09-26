@@ -1,7 +1,9 @@
 package adapter
 
 import (
+	"context"
 	"github.com/julienschmidt/httprouter"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"net/http"
 	"os"
 	"strings"
@@ -15,13 +17,20 @@ func GetEnv(key, fallback string) string {
 	return value
 }
 
-var authCodeTest = GetEnv("AUTH_TOKEN", "test")
+var authCodeTest = GetEnv("AUTH_TOKEN", "")
+
+func (p *MongoDBAdapter) handleHealthRequest(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	err := p.client.Ping(context.TODO(), readpref.PrimaryPreferred())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+}
 
 func (p *MongoDBAdapter) handleAuthRequest(w http.ResponseWriter, r *http.Request, _ httprouter.Params) bool {
-	path := r.URL.Path
-	if strings.HasPrefix(path, "/_health") {
-		w.WriteHeader(200)
-		return false
+	if authCodeTest == "" {
+		return true
 	}
 	apiKey := strings.Replace(r.Header.Get("authorization"), "Bearer ", "", 1)
 	if apiKey != authCodeTest {
